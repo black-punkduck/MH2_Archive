@@ -487,7 +487,7 @@ class MH2AssetBrowserPanel(QWidget):
             with open(self.favorites_storage_file, 'w') as f:
                 json.dump(self.favorites_db, f, indent=4)
         except Exception as e:
-            print(f"[MH2 Archive Error] Failed to write database parameters: {str(e)}")
+            self.mh_glob.env.logLine(1, f"[MH2 Archive Error] Failed to write database parameters: {str(e)}")
 
     def fetch_remote_manifest(self):
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -870,7 +870,7 @@ class MH2AssetBrowserPanel(QWidget):
                             with archive.open(internal_img) as source_img, open(target_thumbnail_dest, 'wb') as dest_file:
                                 dest_file.write(source_img.read())
             except Exception as img_err:
-                print(f"[Image Extract Error] {str(img_err)}")
+                self.mh_glob.env.logLine(1, f"[Image Extract Error] {str(img_err)}")
                 
             for i in range(self.grid_layout.count()):
                 w = self.grid_layout.itemAt(i).widget()
@@ -881,7 +881,7 @@ class MH2AssetBrowserPanel(QWidget):
                         self.highlight_asset(w)
                     break
         else:
-            print(f"[Queue Skip Alert] Target package '{completed_key}' failed: {message}")
+            self.mh_glob.env.logLine(1, f"[Queue Skip Alert] Target package '{completed_key}' failed: {message}")
             if hasattr(self, 'meta_display') and self.meta_display:
                 self.meta_display.append(f"\n⚠️ [SKIPPED] {completed_key} failed to sync or stage.")
 
@@ -961,6 +961,46 @@ class MH2AssetBrowserPanel(QWidget):
             else:
                 shutil.copy2(src, dst)
 
+        def unpack_standard(temp_dir, zipfile):
+            mesh_folder = self.mh_glob.env.basename if self.mh_glob.env.basename else "hm08"
+            user_data_path = self.mh_glob.env.path_userdata.replace("\\", "/")
+            temp_dir = temp_dir.replace("\\", "/")
+            env = self.mh_glob.env
+
+            for root, dirs, files in os.walk(temp_dir, topdown=True):
+                sub_route = os.path.relpath(root, temp_dir).replace("\\", "/")
+                if "/" in sub_route and sub_route.startswith("assets"):
+                    sub_paths = sub_route.split("/")
+                    if len(sub_paths) > 1:
+                        foldertype = sub_paths[1]
+                        if len(sub_paths) > 2:
+                            if foldertype != "themes" and foldertype != "shaders":
+                                p = "/".join([foldertype, mesh_folder])
+                            else:
+                                p = foldertype
+                            p = "/".join([p] + sub_paths[2:])
+
+                            dirname = os.path.join(user_data_path, p).replace("\\", "/")
+                            env.logLine(8, "create1 " + dirname)
+                            env.mkdir(dirname)
+
+                            for efile in files:
+                                source_file = os.path.join(root, efile)
+                                dest_file = os.path.join(dirname, efile)
+                                env.logLine(8, "copy " + source_file + " to " + dest_file)
+                                shutil.copy2(source_file, dest_file)
+                        else:
+                            p = "/".join([foldertype, mesh_folder])
+                            dirname = os.path.join(user_data_path, p).replace("\\", "/")
+                            env.logLine(8, "create2 " + dirname)
+                            env.mkdir(dirname)
+
+                            for efile in files:
+                                source_file = os.path.join(root, efile)
+                                dest_file = os.path.join(dirname, efile)
+                                env.logLine(8, "copy " + source_file + " to " + dest_file)
+                                shutil.copy2(source_file, dest_file)
+
         def classify_directory_for_multitype(dir_path, rel_lower, files_in_dir, allowed):
             exts = {os.path.splitext(f)[1].lower() for f in files_in_dir}
 
@@ -1013,6 +1053,8 @@ class MH2AssetBrowserPanel(QWidget):
         processed_count = 0
         failed_count = 0
 
+        env = self.mh_glob.env
+
         # 1. Process ZIP archives (Pack Mode) using community_packs.json metadata
         for zip_file in staged_zips:
             staged_zip_path = os.path.normpath(os.path.join(self.local_install_destination, zip_file))
@@ -1020,12 +1062,25 @@ class MH2AssetBrowserPanel(QWidget):
             allowed_types = normalize_types(pack_info.get("type", ""))
             manifest_base = str(pack_info.get("base", "")).strip().lower()
 
-            try:
-                self.meta_display.setText(f"Unpacking: {zip_file}...")
-                temp_dir, error = unzipper.unZip(staged_zip_path)
-                if error:
-                    raise ValueError(error)
+            # if unpacking fails, give warning and start next one
+            #
+            self.meta_display.setText(f"Unpacking: {zip_file}...")
+            temp_dir, error = unzipper.unZip(staged_zip_path)
+            if error:
+                QMessageBox.warning(self, "Unpack error", "Unpack failed: "+ staged_zip_path)
+                continue
 
+            # filename based extraction is here:
+            # it will not unzip if it does not fit to mesh, but it will unzip if it fits to parentmesh
+            #
+            zipfilebase = zip_file.lower()
+            if zipfilebase.startswith(("hm08", "fantasy")):
+                unpack_standard(temp_dir, zip_file)
+                unzipper.cleanupUnzip()
+                processed_count += 1
+                continue
+
+            try:
                 for root, dirs, files in os.walk(temp_dir):
                     if not files:
                         continue
@@ -1036,12 +1091,14 @@ class MH2AssetBrowserPanel(QWidget):
                     exts_in_dir = {os.path.splitext(f)[1].lower() for f in files}
 
                     # Respect "base" from community_packs.json first, then path hints
+                    #
                     if manifest_base in ["hm08", "fantasy"]:
                         active_mesh = manifest_base
-                    elif "fantasy" in rel_lower or "fantasy" in zip_file.lower():
+                    elif "fantasy" in rel_lower or "fantasy" in zipfilebase:
                         active_mesh = "fantasy"
                     else:
                         active_mesh = default_mesh
+
 
                     # Respect "type" from community_packs.json
                     if len(allowed_types) == 1:
@@ -1060,8 +1117,8 @@ class MH2AssetBrowserPanel(QWidget):
                                     category = "expressions"
                                 else:
                                     category = "poses"
-                            elif ".mhs" in exts_in_dir:
-                                category = "expressions"
+                            #elif ".mhs" in exts_in_dir:     
+                            #    category = "expressions"       # this will "hide" ".mhskel" 
                             elif ".bvh" in exts_in_dir:
                                 category = "animations"
                             elif ".mhskel" in exts_in_dir:
@@ -1136,14 +1193,13 @@ class MH2AssetBrowserPanel(QWidget):
                         else:
                             final_dst = os.path.join(dest_dir, file)
 
+                        env.logLine(8, rc_file + " >> "+ final_dst)
                         copy_and_sanitize_file(src_file, final_dst)
-
-
 
                 unzipper.cleanupUnzip()
                 processed_count += 1
             except Exception as e:
-                print(f"[Batch Extract Failed] {zip_file}: {str(e)}")
+                env.logLine(1, f"[Batch Extract Failed] {zip_file}: {str(e)}")
                 failed_count += 1
 
         # 2. Process Creator Portal Staged Folders (Asset Mode)
